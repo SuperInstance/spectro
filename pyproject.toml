@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectro-spectrograph"
+version = "0.1.0"
+description = "Multi-model cognitive spectrograph. Split the beam. Read the spectrum."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "SuperInstance"}]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.24",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.scripts]
+spectro = "spectro.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/SuperInstance/spectro"
+Repository = "https://github.com/SuperInstance/spectro"
+
+[tool.setuptools.packages.find]
+include = ["spectro*"]

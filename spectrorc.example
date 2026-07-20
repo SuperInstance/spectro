@@ -1,0 +1,21 @@
+# Spectro test config — copy to spectrorc and fill in your API details.
+# Spectro reads from, in order: constructor args > env vars > ~/.spectrorc > ~/.openclaw/.deepinfra-key
+
+[api]
+# Any OpenAI-compatible endpoint
+base_url = https://api.deepinfra.com/v1/openai
+# Your API key
+api_key = your-key-here
+
+[models]
+# Default ensemble — one per line
+default = deepseek-ai/DeepSeek-V4-Flash
+default = ByteDance/Seed-2.0-mini
+default = deepreinforce-ai/Ornith-1.0-35B
+default = nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B
+default = ByteDance/Seed-2.0-pro
+
+[sampling]
+max_tokens = 2048
+temperature = 0.7
+timeout = 120
