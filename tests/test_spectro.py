@@ -221,6 +221,8 @@ class TestSpectrograph:
         monkeypatch.setattr(
             Spectrograph, "_read_key_file", staticmethod(lambda: "")
         )
+        # Also patch __init__ key discovery to avoid env var bleed
+        monkeypatch.setattr(Spectrograph, "__init__", Spectrograph.__init__.__wrapped__ if hasattr(Spectrograph.__init__, "__wrapped__") else Spectrograph.__init__)
         with pytest.raises(APIKeyMissing, match="No API key"):
             Spectrograph()
 
