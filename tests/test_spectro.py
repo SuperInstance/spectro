@@ -263,8 +263,7 @@ class TestEdgeCases:
         including whitespace-only strings. This test documents current behavior.
         """
         r = ModelResponse(model="test", content="   \n\t  ", elapsed_ms=100)
-        # Whitespace-only content is considered OK by current implementation
-        assert r.ok
+        assert not r.ok
 
     def test_malformed_json_response(self):
         """Test handling of malformed JSON in API response."""
