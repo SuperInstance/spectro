@@ -300,9 +300,13 @@ def _find_divergences(
                         mentions[resp.model] = relevant[:2]
 
             if len(mentions) >= 2:
+                # Check for negation using word boundaries to avoid false
+                # positives like "notable", "nothing", "nevertheless".
+                import re
+                _NEGATION_RE = re.compile(r"\b(?:not|n't|never)\b", re.IGNORECASE)
                 has_negation: dict[str, bool] = {
                     m: any(
-                        "not " in s or "n't" in s or "never" in s
+                        bool(_NEGATION_RE.search(s))
                         for s in sents
                     )
                     for m, sents in mentions.items()

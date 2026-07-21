@@ -233,27 +233,39 @@ class Spectrograph:
         return self._client
 
     def close(self) -> None:
-        """Close the underlying HTTP client (if open)."""
+        """Close the underlying HTTP client (if open).
+
+        Uses a best-effort approach: if an event loop is running, the
+        close is scheduled as a task; otherwise a temporary loop is used.
+        """
         if self._client is not None:
             logger.debug("Closing HTTP client")
             import asyncio
 
             try:
                 loop = asyncio.get_running_loop()
-                if loop.is_running():
-                    loop.create_task(self._client.aclose())
-                else:
-                    asyncio.run(self._client.aclose())
             except RuntimeError:
-                asyncio.run(self._client.aclose())
+                # No running loop — create a temporary one
+                asyncio.run(self._aclose_inner())
+                return
+
+            if loop.is_running():
+                # Running loop — close via a new task; warn it may be fire-and-forget
+                logger.warning("HTTP client close scheduled as background task")
+                loop.create_task(self._aclose_inner())
+            else:
+                asyncio.run(self._aclose_inner())
+            self._client = None
+
+    async def _aclose_inner(self) -> None:
+        """Inner async close logic, safe to call from any event loop."""
+        if self._client is not None:
+            await self._client.aclose()
             self._client = None
 
     async def aclose(self) -> None:
         """Async close the underlying HTTP client."""
-        if self._client is not None:
-            logger.debug("Closing HTTP client (async)")
-            await self._client.aclose()
-            self._client = None
+        await self._aclose_inner()
 
     async def __aenter__(self) -> Spectrograph:
         return self
@@ -271,13 +283,23 @@ class Spectrograph:
     # ------------------------------------------------------------------
 
     async def _query_one(
-        self, client: httpx.AsyncClient, model: str, prompt: str
+        self, client: httpx.AsyncClient, model: str, prompt: str,
+        max_tokens: int | None = None, temperature: float | None = None,
     ) -> ModelResponse:
         """Query a single model with exponential-backoff retry.
 
         Retries on 429 (rate-limit) and 5xx (server) status codes.
         Returns an error-model response on final failure.
+
+        Args:
+            client: The HTTP client to use.
+            model: The model name to query.
+            prompt: The prompt text to send.
+            max_tokens: Max tokens for this response (defaults to self.max_tokens).
+            temperature: Temperature for this query (defaults to self.temperature).
         """
+        actual_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        actual_temp = temperature if temperature is not None else self.temperature
         last_error: Exception | None = None
 
         for attempt in range(1, MAX_RETRIES + 2):  # initial + retries
@@ -288,8 +310,8 @@ class Spectrograph:
                     json={
                         "model": model,
                         "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": self.max_tokens,
-                        "temperature": self.temperature,
+                        "max_tokens": actual_max_tokens,
+                        "temperature": actual_temp,
                     },
                     headers={"Authorization": f"Bearer {self.api_key}"},
                 )
@@ -420,25 +442,47 @@ class Spectrograph:
             error=f"Max retries ({MAX_RETRIES}) exhausted: {last_error}",
         )
 
-    async def _query_all(self, prompt: str) -> list[ModelResponse]:
-        """Query all models in parallel."""
-        client = self._get_client()
-        tasks = [self._query_one(client, m, prompt) for m in self.models]
+    async def _query_all_with_client(
+        self, client: httpx.AsyncClient, prompt: str,
+        model_list: list[str] | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> list[ModelResponse]:
+        """Query all models in parallel using the given client.
+
+        Accepts optional per-call overrides for models, max_tokens, and
+        temperature so that callers never mutate shared state on self.
+        """
+        models = model_list if model_list is not None else self.models
+        tasks = [
+            self._query_one(client, m, prompt, max_tokens=max_tokens, temperature=temperature)
+            for m in models
+        ]
         return await asyncio.gather(*tasks)
 
+    async def _query_all(self, prompt: str) -> list[ModelResponse]:
+        """Query all models in parallel (uses cached client)."""
+        client = self._get_client()
+        return await self._query_all_with_client(client, prompt)
+
     async def _query_stream(
-        self, prompt: str
+        self, prompt: str, model_list: list[str] | None = None,
+        max_tokens: int | None = None, temperature: float | None = None,
     ) -> AsyncIterator[ModelResponse]:
         """Query all models and yield responses as each completes.
 
         Uses asyncio.as_completed so early finishers appear first.
+
+        Accepts optional per-call overrides so callers never mutate
+        shared state on ``self`` (avoids race conditions).
         """
         client = self._get_client()
+        models = model_list if model_list is not None else self.models
         tasks = {
             asyncio.create_task(
-                self._query_one(client, m, prompt)
+                self._query_one(client, m, prompt, max_tokens=max_tokens, temperature=temperature)
             ): m
-            for m in self.models
+            for m in models
         }
 
         for done in asyncio.as_completed(tasks):
@@ -467,27 +511,29 @@ class Spectrograph:
             SpectrumResult with convergences, divergences, and insights.
         """
         # Allow per-call overrides
-        old_models = self.models
-        old_max = self.max_tokens
-        old_temp = self.temperature
-        if models is not None:
-            self.models = models
-        if max_tokens is not None:
-            self.max_tokens = max_tokens
-        if temperature is not None:
-            self.temperature = temperature
+        model_list = models if models is not None else list(self.models)
+        actual_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        actual_temp = temperature if temperature is not None else self.temperature
+
+        # Create a temporary client for this sync call to avoid
+        # reusing a client from a different event loop.
+        temp_client = httpx.AsyncClient(timeout=self.timeout)
 
         t0 = time.monotonic()
         try:
-            responses = asyncio.run(self._query_all(prompt))
+            responses = asyncio.run(
+                self._query_all_with_client(temp_client, prompt, model_list, actual_max_tokens, actual_temp)
+            )
         finally:
-            # Restore overrides (except if models was never overridden)
-            if models is not None:
-                self.models = old_models
-            if max_tokens is not None:
-                self.max_tokens = old_max
-            if temperature is not None:
-                self.temperature = old_temp
+            # Close the temporary client
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(temp_client.aclose())
+                else:
+                    asyncio.run(temp_client.aclose())
+            except RuntimeError:
+                asyncio.run(temp_client.aclose())
 
         elapsed = (time.monotonic() - t0) * 1000
         ok_responses = [r for r in responses if r.ok]
@@ -532,27 +578,23 @@ class Spectrograph:
         """Async version of :meth:`analyze`.
 
         Use inside an existing event loop (e.g., FastAPI, asyncio.run).
-        """
-        old_models = self.models
-        old_max = self.max_tokens
-        old_temp = self.temperature
-        if models is not None:
-            self.models = models
-        if max_tokens is not None:
-            self.max_tokens = max_tokens
-        if temperature is not None:
-            self.temperature = temperature
 
+        Thread-safe: per-call overrides are passed directly to the query
+        methods rather than mutating shared state on ``self``, so multiple
+        concurrent calls do not race on ``self.models`` / ``self.max_tokens``
+        / ``self.temperature``.
+        """
         t0 = time.monotonic()
         try:
-            responses = await self._query_all(prompt)
+            model_list = models if models is not None else self.models
+            responses = await self._query_all_with_client(
+                self._get_client(), prompt,
+                model_list=model_list,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
         finally:
-            if models is not None:
-                self.models = old_models
-            if max_tokens is not None:
-                self.max_tokens = old_max
-            if temperature is not None:
-                self.temperature = old_temp
+            pass
 
         elapsed = (time.monotonic() - t0) * 1000
         ok_responses = [r for r in responses if r.ok]
@@ -590,6 +632,9 @@ class Spectrograph:
         waiting for all models to finish. Useful for progressive
         display or UIs.
 
+        Thread-safe: per-call overrides are passed directly to the
+        query methods rather than mutating shared state on ``self``.
+
         Args:
             prompt: The question or prompt to analyze.
             models: Override the default model list.
@@ -599,23 +644,10 @@ class Spectrograph:
         Yields:
             ModelResponse objects, one per model, in completion order.
         """
-        if models is not None:
-            saved_models = self.models
-            self.models = models
-        if max_tokens is not None:
-            saved_tokens = self.max_tokens
-            self.max_tokens = max_tokens
-        if temperature is not None:
-            saved_temp = self.temperature
-            self.temperature = temperature
-
-        try:
-            async for response in self._query_stream(prompt):
-                yield response
-        finally:
-            if models is not None:
-                self.models = saved_models  # type: ignore[used-before-def]
-            if max_tokens is not None:
-                self.max_tokens = saved_tokens  # type: ignore[used-before-def]
-            if temperature is not None:
-                self.temperature = saved_temp  # type: ignore[used-before-def]
+        async for response in self._query_stream(
+            prompt,
+            model_list=models,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        ):
+            yield response
