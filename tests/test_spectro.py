@@ -1,11 +1,19 @@
 """Tests for Spectro — the multi-model cognitive spectrograph."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import httpx
 
 from spectro.core import Spectrograph, ModelResponse, SpectrumResult
+from spectro.exceptions import (
+    APIKeyMissing,
+    AnalysisTimeout,
+    ModelUnavailable,
+    ResponseMalformed,
+)
 from spectro.analysis import (
     analyze_spectrum,
     extract_keywords,
@@ -205,13 +213,15 @@ class TestSpectrograph:
         assert spec.models == models
 
     def test_init_without_key_raises(self, monkeypatch):
+        # Remove all environment variables that could provide an API key
         monkeypatch.delenv("DEEPINFRA_API_KEY", raising=False)
+        monkeypatch.delenv("DEEPINFRA_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        # Also need to handle key file
+        # Mock the key file reading to return empty
         monkeypatch.setattr(
             Spectrograph, "_read_key_file", staticmethod(lambda: "")
         )
-        with pytest.raises(ValueError, match="No API key"):
+        with pytest.raises(APIKeyMissing, match="No API key"):
             Spectrograph()
 
     def test_read_key_file_from_env(self, monkeypatch, tmp_path):
@@ -228,3 +238,313 @@ class TestSpectrograph:
 
         key = Spectrograph._read_key_file()
         assert key == "file-key-456"
+
+
+# ---------------------------------------------------------------------------
+# Edge case tests: API errors, network issues, malformed responses
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCases:
+    """Test edge cases and error conditions."""
+
+    def test_empty_api_response(self):
+        """Test handling of empty string response from API."""
+        r = ModelResponse(model="test", content="", elapsed_ms=100)
+        assert not r.ok
+        assert r.content == ""
+
+    def test_whitespace_only_response(self):
+        """Test handling of whitespace-only response.
+
+        Note: The current implementation treats any non-empty string as OK,
+        including whitespace-only strings. This test documents current behavior.
+        """
+        r = ModelResponse(model="test", content="   \n\t  ", elapsed_ms=100)
+        # Whitespace-only content is considered OK by current implementation
+        assert r.ok
+
+    def test_malformed_json_response(self):
+        """Test handling of malformed JSON in API response."""
+        spec = Spectrograph(api_key="test-key")
+
+        async def mock_post(*args, **kwargs):
+            class MockResponse:
+                status_code = 200
+                text = "invalid json"
+
+                def json(self):
+                    raise json.JSONDecodeError("Expecting value", "", 0)
+
+                def raise_for_status(self):
+                    pass
+
+            return MockResponse()
+
+        mock_client = AsyncMock()
+        mock_client.post = mock_post
+        result = asyncio.run(spec._query_one(mock_client, "test-model", "hello"))
+        assert not result.ok
+        # Error message should mention the JSON parsing issue
+        assert result.error is not None
+        assert len(result.error) > 0
+
+    def test_missing_choices_in_response(self):
+        """Test handling of response missing 'choices' field."""
+        spec = Spectrograph(api_key="test-key")
+
+        async def mock_post(*args, **kwargs):
+            class MockResponse:
+                status_code = 200
+
+                def json(self):
+                    return {"data": "something"}  # Missing 'choices'
+
+                def raise_for_status(self):
+                    pass
+
+            return MockResponse()
+
+        mock_client = AsyncMock()
+        mock_client.post = mock_post
+        result = asyncio.run(spec._query_one(mock_client, "test-model", "hello"))
+        assert not result.ok
+        assert "Malformed" in result.error or "choices" in result.error.lower()
+
+    def test_empty_content_response(self):
+        """Test handling of empty content response."""
+        spec = Spectrograph(api_key="test-key")
+
+        async def mock_post(*args, **kwargs):
+            class MockResponse:
+                status_code = 200
+
+                def json(self):
+                    return {
+                        "choices": [
+                            {"message": {"content": ""}}
+                        ]
+                    }
+
+                def raise_for_status(self):
+                    pass
+
+            return MockResponse()
+
+        mock_client = AsyncMock()
+        mock_client.post = mock_post
+        result = asyncio.run(spec._query_one(mock_client, "test-model", "hello"))
+        assert result.content == ""
+        assert not result.ok  # Empty content should not be OK
+
+    def test_non_retryable_http_error(self):
+        """Test handling of non-retryable HTTP error (403)."""
+        spec = Spectrograph(api_key="test-key")
+
+        async def mock_post(*args, **kwargs):
+            class MockResponse:
+                status_code = 403
+                text = "Forbidden"
+
+                def raise_for_status(self):
+                    raise httpx.HTTPStatusError(
+                        "403 Forbidden",
+                        request=MagicMock(),
+                        response=self
+                    )
+
+            return MockResponse()
+
+        mock_client = AsyncMock()
+        mock_client.post = mock_post
+        result = asyncio.run(spec._query_one(mock_client, "test-model", "hello"))
+        assert not result.ok
+        assert "403" in result.error or "Forbidden" in result.error
+
+    def test_all_models_fail(self):
+        """Test analyze when all models fail permanently."""
+        spec = Spectrograph(api_key="test-key")
+
+        async def mock_post(*args, **kwargs):
+            # Always fail with non-retryable error
+            class MockResponse:
+                status_code = 403
+                text = "Forbidden"
+
+                def raise_for_status(self):
+                    raise httpx.HTTPStatusError(
+                        "403 Forbidden",
+                        request=MagicMock(),
+                        response=self
+                    )
+
+            return MockResponse()
+
+        mock_client = AsyncMock()
+        mock_client.post = mock_post
+
+        with patch.object(spec, "_get_client", return_value=mock_client):
+            result = asyncio.run(spec._query_all("test prompt"))
+            # Should have responses but none OK
+            assert len(result) > 0
+            assert all(not r.ok for r in result)
+
+    def test_unicode_content(self):
+        """Test handling of Unicode content in responses."""
+        content = "Test with emoji 🎉 and Chinese 你好"
+        r = ModelResponse(model="test", content=content, elapsed_ms=100)
+        assert r.ok
+        assert "🎉" in r.content
+        assert "你好" in r.content
+
+    def test_very_long_response(self):
+        """Test handling of very long response content."""
+        long_content = "word " * 10000  # ~50KB (exactly 50000 chars)
+        r = ModelResponse(model="test", content=long_content, elapsed_ms=100)
+        assert r.ok
+        assert len(r.content) == 50000
+
+    def test_special_characters_in_prompt(self):
+        """Test analyze with special characters in prompt."""
+        spec = Spectrograph(api_key="test-key", models=["model1"])
+
+        async def mock_post(*args, **kwargs):
+            class MockResponse:
+                status_code = 200
+
+                def json(self):
+                    return {
+                        "choices": [
+                            {"message": {"content": "Response"}}
+                        ],
+                        "usage": {"total_tokens": 50}
+                    }
+
+                def raise_for_status(self):
+                    pass
+
+            return MockResponse()
+
+        with patch("httpx.AsyncClient.post", mock_post):
+            # Test various special characters
+            for prompt in [
+                "Test with 'quotes'",
+                'Test with "double quotes"',
+                "Test with\nnewlines",
+                "Test with\ttabs",
+                "Test with $pecial & characters <>",
+                "Test with emoji 🎉",
+            ]:
+                result = spec.analyze(prompt)
+                assert result.n_ok == 1
+
+    def test_model_state_restored_after_analyze(self):
+        """Test that original model state is restored after analyze with overrides."""
+        spec = Spectrograph(api_key="test-key", models=["model1", "model2"])
+        original_models = spec.models.copy()
+        original_max = spec.max_tokens
+        original_temp = spec.temperature
+
+        async def mock_post(*args, **kwargs):
+            class MockResponse:
+                status_code = 200
+
+                def json(self):
+                    return {
+                        "choices": [
+                            {"message": {"content": "Response"}}
+                        ],
+                        "usage": {"total_tokens": 50}
+                    }
+
+                def raise_for_status(self):
+                    pass
+
+            return MockResponse()
+
+        with patch("httpx.AsyncClient.post", mock_post):
+            # Analyze with overrides
+            spec.analyze(
+                "test",
+                models=["override-model"],
+                max_tokens=5000,
+                temperature=0.9
+            )
+
+            # State should be restored
+            assert spec.models == original_models
+            assert spec.max_tokens == original_max
+            assert spec.temperature == original_temp
+
+    def test_spectrum_result_to_dict_edge_cases(self):
+        """Test to_dict with edge case response content."""
+        # Content exactly 500 chars
+        content_500 = "x" * 500
+        responses = [ModelResponse(model="a", content=content_500, elapsed_ms=1, tokens=10)]
+        result = SpectrumResult(prompt="test", responses=responses, confidence=0.5)
+        d = result.to_dict()
+        assert d["responses"][0]["content"] == content_500  # No truncation
+
+        # Content over 500 chars
+        content_600 = "x" * 600
+        responses = [ModelResponse(model="a", content=content_600, elapsed_ms=1, tokens=10)]
+        result = SpectrumResult(prompt="test", responses=responses, confidence=0.5)
+        d = result.to_dict()
+        assert "..." in d["responses"][0]["content"]
+        assert len(d["responses"][0]["content"]) < 600
+
+
+# ---------------------------------------------------------------------------
+# CLI tests
+# ---------------------------------------------------------------------------
+
+
+class TestCLIOutput:
+    """Test CLI output formatting."""
+
+    def test_format_report_basic(self):
+        """Test basic report formatting."""
+        from spectro.cli import format_report
+
+        responses = [
+            ModelResponse(model="model1", content="hello world", elapsed_ms=100),
+            ModelResponse(model="model2", content="hello there", elapsed_ms=150),
+        ]
+        result = SpectrumResult(
+            prompt="test",
+            responses=responses,
+            convergences=[{"concept": "hello", "strength": 1.0, "agreement": 2}],
+            divergences=[],
+            unique_insights=[],
+            confidence=0.8,
+            elapsed_ms=200,
+        )
+        report = format_report(result)
+        assert "test" in report
+        assert "2/2" in report
+        assert "80%" in report
+        assert "hello" in report
+
+    def test_format_report_with_errors(self):
+        """Test report formatting when some models error."""
+        from spectro.cli import format_report
+
+        responses = [
+            ModelResponse(model="model1", content="hello", elapsed_ms=100),
+            ModelResponse(model="model2", content="", elapsed_ms=150, error="timeout"),
+        ]
+        result = SpectrumResult(
+            prompt="test",
+            responses=responses,
+            convergences=[],
+            divergences=[],
+            unique_insights=[],
+            confidence=0.5,
+            elapsed_ms=200,
+        )
+        report = format_report(result)
+        assert "1/2" in report
+
+        # Verbose mode should show the error
+        report_verbose = format_report(result, verbose=True)
+        assert "timeout" in report_verbose or "ERROR" in report_verbose

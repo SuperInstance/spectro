@@ -11,14 +11,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
+from typing import Any
 
-from spectro.core import Spectrograph, DEFAULT_MODELS
+from spectro.core import DEFAULT_MODELS, ModelResponse, Spectrograph, SpectrumResult
+
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
 
 
-def format_report(result, verbose: bool = False) -> str:
-    """Format a SpectrumResult as a readable report."""
-    lines = []
+def format_report(result: SpectrumResult, verbose: bool = False) -> str:
+    """Format a SpectrumResult as a human-readable report.
+
+    Args:
+        result: The spectral analysis result to format.
+        verbose: If True, include full model response text.
+
+    Returns:
+        A formatted string report.
+    """
+    lines: list[str] = []
     lines.append("=" * 72)
     lines.append("SPECTRO — Cognitive Spectrum Report")
     lines.append("=" * 72)
@@ -37,19 +53,28 @@ def format_report(result, verbose: bool = False) -> str:
 
     # Convergences (the coastline)
     lines.append("─" * 72)
-    lines.append(f"CONVERGENCES ({len(result.convergences)}) — High-confidence territory")
+    lines.append(
+        f"CONVERGENCES ({len(result.convergences)}) — "
+        "High-confidence territory"
+    )
     lines.append("─" * 72)
     for c in result.convergences[:15]:
         bar_filled = int(c["strength"] * 10)
         bar = "█" * bar_filled + "░" * (10 - bar_filled)
-        lines.append(f"  {bar} {c['concept']} ({c['agreement']}/{result.n_models})")
+        lines.append(
+            f"  {bar} {c['concept']} "
+            f"({c['agreement']}/{result.n_models})"
+        )
     if len(result.convergences) > 15:
         lines.append(f"  ... and {len(result.convergences) - 15} more")
     lines.append("")
 
     # Divergences (the interesting water)
     lines.append("─" * 72)
-    lines.append(f"DIVERGENCES ({len(result.divergences)}) — Where models disagree")
+    lines.append(
+        f"DIVERGENCES ({len(result.divergences)}) — "
+        "Where models disagree"
+    )
     lines.append("─" * 72)
     for d in result.divergences[:10]:
         if "concept" in d:
@@ -57,18 +82,30 @@ def format_report(result, verbose: bool = False) -> str:
         elif "model_a" in d:
             short_a = d["model_a"].split("/")[-1][:20]
             short_b = d["model_b"].split("/")[-1][:20]
-            lines.append(
-                f"  ◆ {short_a} vs {short_b}: "
-                f"{d.get('phrase_overlap', '?')} overlap — {d.get('note', '')}"
-            )
+            note = d.get("note", "")
+            sim = d.get("semantic_similarity")
+            if sim is not None:
+                lines.append(
+                    f"  ◆ {short_a} vs {short_b}: "
+                    f"phrase={d.get('phrase_overlap', '?')}, "
+                    f"semantic={sim} — {note}"
+                )
+            else:
+                lines.append(
+                    f"  ◆ {short_a} vs {short_b}: "
+                    f"{d.get('phrase_overlap', '?')} overlap — {note}"
+                )
     lines.append("")
 
     # Unique insights (what each model saw alone)
     lines.append("─" * 72)
-    lines.append(f"UNIQUE INSIGHTS ({len(result.unique_insights)}) — Single-model perspectives")
+    lines.append(
+        f"UNIQUE INSIGHTS ({len(result.unique_insights)}) — "
+        "Single-model perspectives"
+    )
     lines.append("─" * 72)
     # Group by model
-    by_model = {}
+    by_model: dict[str, list[dict[str, Any]]] = {}
     for u in result.unique_insights[:20]:
         model = u["model"].split("/")[-1]
         if model not in by_model:
@@ -94,7 +131,10 @@ def format_report(result, verbose: bool = False) -> str:
             lines.append(f"\n{'─' * 72}")
             short = resp.model.split("/")[-1]
             status = "OK" if resp.ok else f"ERROR: {resp.error}"
-            lines.append(f"MODEL: {short} ({resp.elapsed_ms:.0f}ms, {resp.tokens} tok) [{status}]")
+            lines.append(
+                f"MODEL: {short} ({resp.elapsed_ms:.0f}ms, "
+                f"{resp.tokens} tok) [{status}]"
+            )
             lines.append("─" * 72)
             if resp.ok:
                 lines.append(resp.content)
@@ -104,24 +144,35 @@ def format_report(result, verbose: bool = False) -> str:
 
 
 def main() -> int:
+    """Entry point for the ``spectro`` CLI.
+
+    Returns:
+        Exit code (0 for success, 1 for error).
+    """
     parser = argparse.ArgumentParser(
         prog="spectro",
-        description="Multi-model cognitive spectrograph. Split the beam. Read the spectrum.",
+        description=(
+            "Multi-model cognitive spectrograph. "
+            "Split the beam. Read the spectrum."
+        ),
     )
     parser.add_argument("prompt", help="The prompt/question to analyze")
     parser.add_argument(
-        "--models", "-m",
+        "--models",
+        "-m",
         help="Comma-separated model list (default: 5-model ensemble)",
         default=None,
     )
     parser.add_argument(
-        "--format", "-f",
+        "--format",
+        "-f",
         choices=["text", "json"],
         default="text",
         help="Output format",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Show full model responses",
     )
@@ -132,7 +183,8 @@ def main() -> int:
         help="Max tokens per response",
     )
     parser.add_argument(
-        "--temperature", "-t",
+        "--temperature",
+        "-t",
         type=float,
         default=0.7,
         help="Sampling temperature",
@@ -142,8 +194,21 @@ def main() -> int:
         action="store_true",
         help="List default ensemble models and exit",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str.upper,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="WARNING",
+        help="Set the logging level",
+    )
 
     args = parser.parse_args()
+
+    # Configure logging
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(levelname)s [%(name)s] %(message)s",
+    )
 
     if args.list_models:
         print("Default ensemble (the repertory company):")
@@ -151,8 +216,8 @@ def main() -> int:
             print(f"  {m}")
         return 0
 
-    models = None
-    if args.models:
+    models: list[str] | None = None
+    if args.models is not None:
         models = [m.strip() for m in args.models.split(",")]
 
     try:

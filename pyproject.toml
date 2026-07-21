@@ -24,6 +24,17 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+[project.optional-dependencies]
+semantic = [
+    "sentence-transformers>=2.2",
+    "numpy>=1.24",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.21",
+    "httpx>=0.24",
+]
+
 [project.scripts]
 spectro = "spectro.cli:main"
 
@@ -33,3 +44,7 @@ Repository = "https://github.com/SuperInstance/spectro"
 
 [tool.setuptools.packages.find]
 include = ["spectro*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

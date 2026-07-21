@@ -9,12 +9,24 @@ Quick start:
     result = spec.analyze("What makes a good API?")
 """
 
+from __future__ import annotations
+
+import logging
+
 from spectro.core import Spectrograph, SpectrumResult, ModelResponse
 
 try:
     from spectro.analysis import analyze_spectrum
 except ImportError:
-    analyze_spectrum = None
+    analyze_spectrum = None  # type: ignore[assignment]
+
+from spectro.exceptions import (
+    APIKeyMissing,
+    AnalysisTimeout,
+    ModelUnavailable,
+    ResponseMalformed,
+    SpectroError,
+)
 
 __version__ = "0.1.0"
 __author__ = "SuperInstance"
@@ -25,4 +37,15 @@ __all__ = [
     "SpectrumResult",
     "ModelResponse",
     "analyze_spectrum",
+    "SpectroError",
+    "APIKeyMissing",
+    "ModelUnavailable",
+    "AnalysisTimeout",
+    "ResponseMalformed",
 ]
+
+# ---------------------------------------------------------------------------
+# Logging — quiet by default, loud when asked
+# ---------------------------------------------------------------------------
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
